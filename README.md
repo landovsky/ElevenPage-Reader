@@ -114,14 +114,20 @@ This extension uses **Manifest V3**.
 
 ### **Build Process**
 
-The project uses esbuild to bundle content scripts:
+The project uses esbuild to bundle the content script, service worker, and popup:
 
 ```bash
 npm run build        # One-time build
 npm run build:watch  # Watch mode for development
 ```
 
-Entry point: `src/content/content-entry.js` -> `dist/content-entry.js`
+Entry points:
+
+* `src/content/content-entry.js` -> `dist/content-entry.js`
+* `src/background/service-worker.js` -> `dist/service-worker.js`
+* `src/popup/popup.js` -> `dist/popup.js`
+
+Shared constants (message types, storage keys) live in `src/shared/constants.js` and are bundled into each entry.
 
 ### **A Note on Highlighting**
 

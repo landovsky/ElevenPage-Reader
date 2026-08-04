@@ -1,11 +1,15 @@
 /**
  * Property-based tests for paragraph buttons module
- * 
+ *
  * Feature: elevenlabs-reader
- * Property 8: Paragraph Button Injection Completeness
+ * Property 8: Paragraph Button Hover Behavior
+ *
+ * The buttons module maintains ONE floating play button appended to
+ * document.body and repositions it next to whichever parsed paragraph the
+ * cursor is over. The page's own DOM is never wrapped or reparented.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fc from 'fast-check';
 import { JSDOM } from 'jsdom';
 
@@ -16,7 +20,7 @@ import {
   getButtonCount,
   getButtons,
   BUTTON_CLASS,
-  WRAPPER_CLASS,
+  BUTTON_VISIBLE_CLASS,
   PARAGRAPH_INDEX_ATTR
 } from '../../src/content/paragraph-buttons.js';
 
@@ -29,7 +33,7 @@ import {
 /**
  * Helper to create a DOM document with paragraphs
  * @param {string[]} paragraphTexts - Array of paragraph text contents
- * @returns {Document} JSDOM document
+ * @returns {{dom: JSDOM, document: Document}}
  */
 function createDocument(paragraphTexts) {
   const html = `
@@ -43,14 +47,15 @@ function createDocument(paragraphTexts) {
     </html>
   `;
   const dom = new JSDOM(html);
-  return dom.window.document;
+  return { dom, document: dom.window.document };
 }
 
 /**
  * Setup global document and chrome mock for tests
  */
-function setupGlobals(doc) {
+function setupGlobals(dom, doc) {
   global.document = doc;
+  global.window = dom.window;
   global.chrome = {
     runtime: {
       sendMessage: vi.fn().mockResolvedValue({ success: true })
@@ -63,208 +68,183 @@ function setupGlobals(doc) {
  */
 function cleanupGlobals() {
   delete global.document;
+  delete global.window;
   delete global.chrome;
 }
 
+/**
+ * Dispatch a bubbling mouseover event on an element
+ */
+function hover(dom, element) {
+  element.dispatchEvent(new dom.window.MouseEvent('mouseover', { bubbles: true }));
+}
+
+/**
+ * Arbitrary for arrays of readable paragraph texts
+ */
+const paragraphArbitrary = (maxLength = 8) => fc.array(
+  fc.stringOf(
+    fc.char16bits().filter(c => /[a-zA-Z0-9 .,!?]/.test(c)),
+    { minLength: 5, maxLength: 50 }
+  ).filter(s => s.trim().length > 0),
+  { minLength: 1, maxLength: maxLength }
+);
+
 describe('Paragraph Buttons Module - Property Tests', () => {
-  
+
   afterEach(() => {
-    // Clean up any injected buttons
     removeButtons();
     cleanupGlobals();
   });
 
-  /**
-   * Property 8: Paragraph Button Injection Completeness
-   * For any page with N paragraphs containing readable text, the paragraph
-   * button manager should inject exactly N paragraph buttons, one adjacent
-   * to each paragraph.
-   */
-  describe('Property 8: Paragraph Button Injection Completeness', () => {
-    
-    it('should inject exactly one button per paragraph with readable text', () => {
-      // Generate array of non-empty paragraph texts
-      const paragraphArbitrary = fc.array(
-        fc.stringOf(
-          fc.char16bits().filter(c => /[a-zA-Z0-9 .,!?]/.test(c)),
-          { minLength: 5, maxLength: 100 }
-        ).filter(s => s.trim().length > 0),
-        { minLength: 1, maxLength: 10 }
-      );
+  describe('Property 8: Hover Button Behavior', () => {
 
+    it('should create exactly one hidden button regardless of paragraph count', () => {
       fc.assert(
         fc.property(
-          paragraphArbitrary,
+          paragraphArbitrary(10),
           (paragraphTexts) => {
-            // Create document and setup globals
-            const doc = createDocument(paragraphTexts);
-            setupGlobals(doc);
-            
-            // Parse the content
+            const { dom, document: doc } = createDocument(paragraphTexts);
+            setupGlobals(dom, doc);
+
             const parsed = parsePageContent(doc);
-            const paragraphCount = parsed.paragraphs.length;
-            
-            // Inject buttons
             const buttons = injectButtons(parsed.paragraphs);
-            
-            // Should have exactly one button per paragraph
-            const injectedCount = getButtonCount();
-            
-            // Clean up for next iteration
+
+            const oneButton = getButtonCount() === 1 && buttons.length === 1;
+            const inBody = buttons[0].parentElement === doc.body;
+            const hiddenInitially = !buttons[0].classList.contains(BUTTON_VISIBLE_CLASS);
+
             removeButtons();
-            
-            return injectedCount === paragraphCount && buttons.length === paragraphCount;
+
+            return oneButton && inBody && hiddenInitially;
           }
         ),
         { numRuns: 100 }
       );
     });
 
-    it('should inject buttons with correct paragraph indices', () => {
-      const paragraphArbitrary = fc.array(
-        fc.stringOf(
-          fc.char16bits().filter(c => /[a-zA-Z0-9 .,!?]/.test(c)),
-          { minLength: 5, maxLength: 50 }
-        ).filter(s => s.trim().length > 0),
-        { minLength: 1, maxLength: 8 }
-      );
-
+    it('should never wrap or reparent the page paragraphs', () => {
       fc.assert(
         fc.property(
-          paragraphArbitrary,
+          paragraphArbitrary(8),
           (paragraphTexts) => {
-            const doc = createDocument(paragraphTexts);
-            setupGlobals(doc);
-            
+            const { dom, document: doc } = createDocument(paragraphTexts);
+            setupGlobals(dom, doc);
+
             const parsed = parsePageContent(doc);
+            const parentsBefore = parsed.paragraphs.map(p => p.element.parentElement);
+            const htmlBefore = parsed.paragraphs.map(p => p.element.outerHTML);
+
             injectButtons(parsed.paragraphs);
-            
-            const buttons = getButtons();
-            
-            // Each button should have the correct paragraph index
-            let allIndicesCorrect = true;
-            for (let i = 0; i < buttons.length; i++) {
-              const buttonIndex = parseInt(buttons[i].getAttribute(PARAGRAPH_INDEX_ATTR), 10);
-              if (buttonIndex !== i) {
-                allIndicesCorrect = false;
-                break;
-              }
+            // Hover each paragraph to exercise the show/position path
+            for (const p of parsed.paragraphs) {
+              hover(dom, p.element);
             }
-            
+
+            const parentsUnchanged = parsed.paragraphs.every(
+              (p, i) => p.element.parentElement === parentsBefore[i]
+            );
+            const htmlUnchanged = parsed.paragraphs.every(
+              (p, i) => p.element.outerHTML === htmlBefore[i]
+            );
+
             removeButtons();
-            
-            return allIndicesCorrect;
+
+            return parentsUnchanged && htmlUnchanged;
           }
         ),
         { numRuns: 100 }
       );
     });
 
-    it('should inject buttons adjacent to their respective paragraphs', () => {
-      const paragraphArbitrary = fc.array(
-        fc.stringOf(
-          fc.char16bits().filter(c => /[a-zA-Z0-9 .,!?]/.test(c)),
-          { minLength: 5, maxLength: 50 }
-        ).filter(s => s.trim().length > 0),
-        { minLength: 1, maxLength: 6 }
-      );
-
+    it('should point the button at the hovered paragraph with a matching index and label', () => {
       fc.assert(
         fc.property(
-          paragraphArbitrary,
+          paragraphArbitrary(8),
           (paragraphTexts) => {
-            const doc = createDocument(paragraphTexts);
-            setupGlobals(doc);
-            
+            const { dom, document: doc } = createDocument(paragraphTexts);
+            setupGlobals(dom, doc);
+
             const parsed = parsePageContent(doc);
             injectButtons(parsed.paragraphs);
-            
-            // Each button should be inside a wrapper that contains its paragraph
-            let allAdjacent = true;
+            const [button] = getButtons();
+
+            let allCorrect = true;
             for (let i = 0; i < parsed.paragraphs.length; i++) {
-              const paragraph = parsed.paragraphs[i].element;
-              const wrapper = paragraph.parentElement;
-              
-              // Wrapper should have the wrapper class
-              if (!wrapper || !wrapper.classList.contains(WRAPPER_CLASS)) {
-                allAdjacent = false;
-                break;
-              }
-              
-              // Wrapper should contain a button with matching index
-              const button = wrapper.querySelector(`.${BUTTON_CLASS}`);
-              if (!button) {
-                allAdjacent = false;
-                break;
-              }
-              
-              const buttonIndex = parseInt(button.getAttribute(PARAGRAPH_INDEX_ATTR), 10);
-              if (buttonIndex !== i) {
-                allAdjacent = false;
+              hover(dom, parsed.paragraphs[i].element);
+
+              const visible = button.classList.contains(BUTTON_VISIBLE_CLASS);
+              const index = parseInt(button.getAttribute(PARAGRAPH_INDEX_ATTR), 10);
+              const label = button.getAttribute('aria-label');
+
+              if (!visible || index !== i || label !== `Play paragraph ${i + 1}`) {
+                allCorrect = false;
                 break;
               }
             }
-            
+
             removeButtons();
-            
-            return allAdjacent;
+
+            return allCorrect;
           }
         ),
         { numRuns: 100 }
       );
+    });
+
+    it('should follow hovers on nested elements inside a paragraph', () => {
+      const { dom, document: doc } = createDocument(['Some text with markup.']);
+      setupGlobals(dom, doc);
+
+      // Add an inline element inside the paragraph after parsing
+      const parsed = parsePageContent(doc);
+      const inner = doc.createElement('em');
+      inner.textContent = 'nested';
+      parsed.paragraphs[0].element.appendChild(inner);
+
+      injectButtons(parsed.paragraphs);
+      const [button] = getButtons();
+
+      hover(dom, inner);
+
+      expect(button.classList.contains(BUTTON_VISIBLE_CLASS)).toBe(true);
+      expect(button.getAttribute(PARAGRAPH_INDEX_ATTR)).toBe('0');
     });
 
     it('should handle empty paragraph array', () => {
-      fc.assert(
-        fc.property(
-          fc.constant([]),
-          (emptyArray) => {
-            const doc = createDocument([]);
-            setupGlobals(doc);
-            
-            const buttons = injectButtons(emptyArray);
-            const count = getButtonCount();
-            
-            removeButtons();
-            
-            return buttons.length === 0 && count === 0;
-          }
-        ),
-        { numRuns: 10 }
-      );
+      const { dom, document: doc } = createDocument([]);
+      setupGlobals(dom, doc);
+
+      const buttons = injectButtons([]);
+
+      expect(buttons.length).toBe(0);
+      expect(getButtonCount()).toBe(0);
+      expect(doc.querySelectorAll(`.${BUTTON_CLASS}`).length).toBe(0);
     });
 
-    it('should remove all buttons when removeButtons is called', () => {
-      const paragraphArbitrary = fc.array(
-        fc.stringOf(
-          fc.char16bits().filter(c => /[a-zA-Z0-9 .,!?]/.test(c)),
-          { minLength: 5, maxLength: 50 }
-        ).filter(s => s.trim().length > 0),
-        { minLength: 1, maxLength: 8 }
-      );
-
+    it('should remove the button and stop reacting to hovers after removeButtons', () => {
       fc.assert(
         fc.property(
-          paragraphArbitrary,
+          paragraphArbitrary(6),
           (paragraphTexts) => {
-            const doc = createDocument(paragraphTexts);
-            setupGlobals(doc);
-            
+            const { dom, document: doc } = createDocument(paragraphTexts);
+            setupGlobals(dom, doc);
+
             const parsed = parsePageContent(doc);
             injectButtons(parsed.paragraphs);
-            
-            // Verify buttons were injected
             const countBefore = getButtonCount();
-            
-            // Remove buttons
+
             removeButtons();
-            
-            // Verify all buttons removed
+
             const countAfter = getButtonCount();
             const buttonsInDom = doc.querySelectorAll(`.${BUTTON_CLASS}`).length;
-            const wrappersInDom = doc.querySelectorAll(`.${WRAPPER_CLASS}`).length;
-            
-            return countBefore > 0 && countAfter === 0 && buttonsInDom === 0 && wrappersInDom === 0;
+
+            // Hovering after removal must not throw or resurrect the button
+            hover(dom, parsed.paragraphs[0].element);
+            const stillGone = doc.querySelectorAll(`.${BUTTON_CLASS}`).length === 0;
+
+            return countBefore === 1 && countAfter === 0 &&
+                   buttonsInDom === 0 && stillGone;
           }
         ),
         { numRuns: 100 }
@@ -273,78 +253,41 @@ describe('Paragraph Buttons Module - Property Tests', () => {
   });
 
   describe('Button Properties', () => {
-    
-    it('should create buttons with correct accessibility attributes', () => {
-      const paragraphArbitrary = fc.array(
-        fc.stringOf(
-          fc.char16bits().filter(c => /[a-zA-Z0-9 .,!?]/.test(c)),
-          { minLength: 5, maxLength: 50 }
-        ).filter(s => s.trim().length > 0),
-        { minLength: 1, maxLength: 5 }
-      );
 
-      fc.assert(
-        fc.property(
-          paragraphArbitrary,
-          (paragraphTexts) => {
-            const doc = createDocument(paragraphTexts);
-            setupGlobals(doc);
-            
-            const parsed = parsePageContent(doc);
-            injectButtons(parsed.paragraphs);
-            
-            const buttons = getButtons();
-            
-            // Each button should have proper accessibility attributes
-            let allAccessible = true;
-            for (const button of buttons) {
-              if (!button.hasAttribute('aria-label') ||
-                  !button.hasAttribute('title') ||
-                  button.getAttribute('type') !== 'button') {
-                allAccessible = false;
-                break;
-              }
-            }
-            
-            removeButtons();
-            
-            return allAccessible;
-          }
-        ),
-        { numRuns: 100 }
-      );
+    it('should create the button with correct accessibility attributes and class', () => {
+      const { dom, document: doc } = createDocument(['First paragraph.', 'Second paragraph.']);
+      setupGlobals(dom, doc);
+
+      const parsed = parsePageContent(doc);
+      injectButtons(parsed.paragraphs);
+      const [button] = getButtons();
+
+      expect(button.classList.contains(BUTTON_CLASS)).toBe(true);
+      expect(button.getAttribute('type')).toBe('button');
+      expect(button.hasAttribute('aria-label')).toBe(true);
+      expect(button.hasAttribute('title')).toBe(true);
     });
 
-    it('should create buttons with the correct CSS class', () => {
-      const paragraphArbitrary = fc.array(
-        fc.stringOf(
-          fc.char16bits().filter(c => /[a-zA-Z0-9 .,!?]/.test(c)),
-          { minLength: 5, maxLength: 50 }
-        ).filter(s => s.trim().length > 0),
-        { minLength: 1, maxLength: 5 }
-      );
+    it('should send JUMP_TO_PARAGRAPH with the hovered paragraph index and text on click', async () => {
+      const { dom, document: doc } = createDocument(['First paragraph.', 'Second paragraph here.']);
+      setupGlobals(dom, doc);
 
-      fc.assert(
-        fc.property(
-          paragraphArbitrary,
-          (paragraphTexts) => {
-            const doc = createDocument(paragraphTexts);
-            setupGlobals(doc);
-            
-            const parsed = parsePageContent(doc);
-            injectButtons(parsed.paragraphs);
-            
-            const buttons = getButtons();
-            
-            // Each button should have the correct class
-            const allHaveClass = buttons.every(btn => btn.classList.contains(BUTTON_CLASS));
-            
-            removeButtons();
-            
-            return allHaveClass;
-          }
-        ),
-        { numRuns: 100 }
+      const parsed = parsePageContent(doc);
+      injectButtons(parsed.paragraphs);
+      const [button] = getButtons();
+
+      hover(dom, parsed.paragraphs[1].element);
+      button.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+
+      // Click handler is async; let it settle
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(global.chrome.runtime.sendMessage).toHaveBeenCalledTimes(1);
+      const message = global.chrome.runtime.sendMessage.mock.calls[0][0];
+      expect(message.type).toBe('jumpToParagraph');
+      expect(message.payload.paragraphIndex).toBe(1);
+      expect(message.payload.text).toBe(
+        parsed.paragraphs[1].sentences.map(s => s.text).join(' ')
       );
     });
   });

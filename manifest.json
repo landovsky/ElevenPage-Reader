@@ -3,17 +3,16 @@
   "name": "ElevenPage Reader",
   "version": "1.0.0",
   "description": "Convert web pages to audio using ElevenLabs AI voices with synchronized highlighting",
+  "minimum_chrome_version": "116",
   
   "permissions": [
     "storage",
     "activeTab",
-    "scripting",
     "offscreen"
   ],
   
   "background": {
-    "service_worker": "src/background/service-worker.js",
-    "type": "module"
+    "service_worker": "dist/service-worker.js"
   },
   
   "content_scripts": [

@@ -1,45 +1,7 @@
 // ElevenPage Reader - Popup UI
 // Extension popup for settings and controls
 
-/**
- * Message types for communication with service worker
- */
-const MessageType = {
-  PLAY: 'play',
-  PAUSE: 'pause',
-  STOP: 'stop',
-  SET_SPEED: 'setSpeed',
-  GET_STATE: 'getState',
-  GET_VOICES: 'getVoices',
-  SET_API_KEY: 'setApiKey',
-  SET_VOICE: 'setVoice',
-  PLAYBACK_STATE_CHANGE: 'playbackStateChange',
-  SET_AUTO_CONTINUE: 'setAutoContinue',
-  SHOW_PLAYER: 'showPlayer',
-  INITIALIZE: 'initialize'
-};
-
-/**
- * Playback status enum
- */
-const PlaybackStatus = {
-  IDLE: 'idle',
-  LOADING: 'loading',
-  PLAYING: 'playing',
-  PAUSED: 'paused',
-  ERROR: 'error'
-};
-
-/**
- * Storage keys
- */
-const STORAGE_KEYS = {
-  API_KEY: 'apiKey',
-  SELECTED_VOICE_ID: 'selectedVoiceId',
-  PLAYBACK_SPEED: 'playbackSpeed',
-  AUTO_CONTINUE: 'autoContinue',
-  AUTO_START: 'autoStart'
-};
+import { MessageType, PlaybackStatus, STORAGE_KEYS } from '../shared/constants.js';
 
 /**
  * PopupController - Manages popup UI state and interactions
@@ -625,11 +587,9 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // Export for testing
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = {
-    PopupController,
-    MessageType,
-    PlaybackStatus,
-    STORAGE_KEYS
-  };
-}
+export {
+  PopupController,
+  MessageType,
+  PlaybackStatus,
+  STORAGE_KEYS
+};

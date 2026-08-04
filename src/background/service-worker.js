@@ -1,51 +1,8 @@
 // ElevenPage Reader - Service Worker
 // Handles ElevenLabs API communication, audio management, and global state
 
-/**
- * Message types for communication between components
- */
-const MessageType = {
-  // Playback control
-  PLAY: 'play',
-  PAUSE: 'pause',
-  STOP: 'stop',
-  SET_SPEED: 'setSpeed',
-  JUMP_TO_PARAGRAPH: 'jumpToParagraph',
-  SKIP_NEXT: 'skipNext',
-  SKIP_PREVIOUS: 'skipPrevious',
-  
-  // State queries
-  GET_STATE: 'getState',
-  GET_VOICES: 'getVoices',
-  
-  // Settings
-  SET_API_KEY: 'setApiKey',
-  SET_VOICE: 'setVoice',
-  SET_AUTO_CONTINUE: 'setAutoContinue',
-  
-  // Auto-continue
-  GET_NEXT_PARAGRAPH: 'getNextParagraph',
-  SET_TOTAL_PARAGRAPHS: 'setTotalParagraphs',
-  
-  // UI control
-  SHOW_PLAYER: 'showPlayer',
-  INITIALIZE: 'initialize',
-  
-  // Events to content script
-  HIGHLIGHT_UPDATE: 'highlightUpdate',
-  PLAYBACK_STATE_CHANGE: 'playbackStateChange'
-};
-
-/**
- * Playback status enum
- */
-const PlaybackStatus = {
-  IDLE: 'idle',
-  LOADING: 'loading',
-  PLAYING: 'playing',
-  PAUSED: 'paused',
-  ERROR: 'error'
-};
+import { MessageType, PlaybackStatus, STORAGE_KEYS } from '../shared/constants.js';
+import { textToSpeech, getVoices } from '../../lib/elevenlabs-api.js';
 
 /**
  * Early threshold in seconds for skip previous behavior
@@ -73,11 +30,30 @@ let playbackState = {
  * Audio playback context
  */
 let audioContext = {
-  audioData: null,        // ArrayBuffer of audio data
+  audioData: null,        // Base64-encoded audio data
   alignmentData: null,    // Timestamp alignment data
   tabId: null,            // Tab ID where playback is active
   offscreenReady: false   // Whether offscreen document is ready
 };
+
+/**
+ * Generation counter for play requests. Incremented whenever a new play or
+ * stop supersedes in-flight work, so a stale TTS response is discarded
+ * instead of starting playback the user has already replaced.
+ */
+let playbackGeneration = 0;
+
+/**
+ * AbortController for the in-flight play TTS request, so a superseding play
+ * or stop cancels the network request instead of just discarding its result
+ */
+let playAbortController = null;
+
+/**
+ * Playback time of the last persisted state snapshot, used to throttle
+ * session-storage writes during 50ms timeUpdate ticks
+ */
+let lastPersistedTime = 0;
 
 /**
  * Preload state for next paragraph audio
@@ -85,7 +61,7 @@ let audioContext = {
  */
 let preloadState = {
   paragraphIndex: null,      // Index of preloaded paragraph
-  audioData: null,           // Cached ArrayBuffer of audio
+  audioData: null,           // Cached base64-encoded audio
   alignmentData: null,       // Cached alignment data
   pendingRequest: null,      // Promise for in-flight preload request
   abortController: null      // AbortController to cancel pending requests
@@ -174,11 +150,13 @@ async function preloadAudio(text, paragraphIndex) {
   }
   
   try {
-    const response = await generateSpeech(apiKey, text, voiceId);
-    
+    const response = await textToSpeech(apiKey, text, voiceId, {
+      signal: preloadState.abortController?.signal
+    });
+
     // Store in preload cache (only if still relevant)
     if (preloadState.paragraphIndex === paragraphIndex) {
-      preloadState.audioData = response.audio;
+      preloadState.audioData = response.audioBase64;
       preloadState.alignmentData = response.alignment;
       preloadState.pendingRequest = null;
     }
@@ -191,18 +169,6 @@ async function preloadAudio(text, paragraphIndex) {
   }
 }
 
-
-/**
- * Storage keys (matching lib/storage.js)
- */
-const STORAGE_KEYS = {
-  API_KEY: 'apiKey',
-  SELECTED_VOICE_ID: 'selectedVoiceId',
-  PLAYBACK_SPEED: 'playbackSpeed',
-  CACHED_VOICES: 'cachedVoices',
-  VOICES_CACHED_AT: 'voicesCachedAt',
-  AUTO_CONTINUE: 'autoContinue'
-};
 
 /**
  * Get a value from Chrome storage
@@ -230,19 +196,111 @@ async function saveToStorage(key, value) {
 }
 
 /**
- * Initialize playback state from storage
+ * chrome.storage.session keys for state that must survive service worker
+ * suspension. MV3 suspends idle service workers after ~30s, wiping all
+ * module-level variables — anything needed to resume a paused read has to
+ * live here and be restored on the next wake-up.
  */
-async function initializeState() {
+const SESSION_KEYS = {
+  PLAYBACK_STATE: 'sessionPlaybackState',
+  AUDIO_CONTEXT: 'sessionAudioContext'
+};
+
+/**
+ * Read keys from chrome.storage.session, tolerating environments where the
+ * API is unavailable
+ * @param {string[]} keys - Keys to read
+ * @returns {Promise<Object>}
+ */
+async function sessionGet(keys) {
+  if (!chrome.storage?.session) return {};
+  try {
+    return await chrome.storage.session.get(keys);
+  } catch (e) {
+    console.warn('ElevenPage Reader: Failed to read session state:', e);
+    return {};
+  }
+}
+
+/**
+ * Write items to chrome.storage.session. Persistence is best-effort: on
+ * failure (missing API, quota exceeded) playback continues, resume just
+ * falls back to re-fetching audio.
+ * @param {Object} items - Items to write
+ */
+async function sessionSet(items) {
+  if (!chrome.storage?.session) return;
+  try {
+    await chrome.storage.session.set(items);
+  } catch (e) {
+    console.warn('ElevenPage Reader: Failed to persist session state:', e);
+  }
+}
+
+/**
+ * Persist the current playback state so it survives worker suspension
+ */
+function persistPlaybackState() {
+  lastPersistedTime = playbackState.currentTime;
+  return sessionSet({ [SESSION_KEYS.PLAYBACK_STATE]: playbackState });
+}
+
+/**
+ * Persist the audio context (minus offscreenReady, which is per-worker).
+ * One paragraph of base64 audio fits comfortably in the 10MB session quota;
+ * if a write fails, resume falls back to re-fetching the paragraph.
+ */
+function persistAudioContext() {
+  return sessionSet({
+    [SESSION_KEYS.AUDIO_CONTEXT]: {
+      audioData: audioContext.audioData,
+      alignmentData: audioContext.alignmentData,
+      tabId: audioContext.tabId
+    }
+  });
+}
+
+/**
+ * Restore state on service worker startup.
+ * Settings come from local storage; live playback state comes from session
+ * storage if a previous worker instance persisted it before being suspended.
+ */
+async function restoreState() {
   const savedSpeed = await getFromStorage(STORAGE_KEYS.PLAYBACK_SPEED);
   if (savedSpeed !== undefined && savedSpeed >= 0.5 && savedSpeed <= 3.0) {
     playbackState.speed = savedSpeed;
   }
-  
+
   const savedAutoContinue = await getFromStorage(STORAGE_KEYS.AUTO_CONTINUE);
   // Default to true if not set
   playbackState.autoContinue = savedAutoContinue !== undefined ? savedAutoContinue : true;
-  
-  console.log('ElevenPage Reader service worker initialized with speed:', playbackState.speed, 'autoContinue:', playbackState.autoContinue);
+
+  const stored = await sessionGet([SESSION_KEYS.PLAYBACK_STATE, SESSION_KEYS.AUDIO_CONTEXT]);
+
+  const storedAudio = stored[SESSION_KEYS.AUDIO_CONTEXT];
+  if (storedAudio) {
+    audioContext.audioData = storedAudio.audioData || null;
+    audioContext.alignmentData = storedAudio.alignmentData || null;
+    audioContext.tabId = storedAudio.tabId || null;
+  }
+
+  const storedState = stored[SESSION_KEYS.PLAYBACK_STATE];
+  if (storedState) {
+    playbackState = { ...playbackState, ...storedState };
+    // A worker cannot be suspended while audio is actually playing (the 50ms
+    // timeUpdate messages keep it alive), so a restored PLAYING/LOADING
+    // status is stale: downgrade to PAUSED when the audio survived, else IDLE.
+    if (playbackState.status === PlaybackStatus.PLAYING ||
+        playbackState.status === PlaybackStatus.LOADING) {
+      playbackState.status = audioContext.audioData
+        ? PlaybackStatus.PAUSED
+        : PlaybackStatus.IDLE;
+      await persistPlaybackState();
+    }
+  }
+
+  console.log('ElevenPage Reader service worker initialized:', playbackState.status,
+    'speed:', playbackState.speed, 'autoContinue:', playbackState.autoContinue);
 }
 
 /**
@@ -259,6 +317,7 @@ function getPlaybackState() {
  */
 async function updatePlaybackState(updates) {
   playbackState = { ...playbackState, ...updates };
+  await persistPlaybackState();
   await broadcastStateChange();
 }
 
@@ -321,12 +380,32 @@ async function handlePlay(payload) {
   if (playbackState.status === PlaybackStatus.PLAYING) {
     return { success: false, error: 'Already playing' };
   }
-  
+
   // If paused, resume playback
-  if (playbackState.status === PlaybackStatus.PAUSED && audioContext.audioData) {
-    await updatePlaybackState({ status: PlaybackStatus.PLAYING });
-    await sendToOffscreen({ type: 'resume' });
-    return { success: true };
+  if (playbackState.status === PlaybackStatus.PAUSED) {
+    if (audioContext.audioData) {
+      // The offscreen document closes itself after ~30s without audio, and a
+      // suspended worker loses it too. If it is gone, recreate it and restart
+      // the stored audio from the paused position instead of resuming.
+      if (await hasOffscreenDocument()) {
+        await sendToOffscreen({ type: 'resume' });
+      } else {
+        await ensureOffscreenDocument();
+        await sendToOffscreen({
+          type: 'play',
+          audioBase64: audioContext.audioData,
+          speed: playbackState.speed,
+          startTime: playbackState.currentTime
+        });
+      }
+      await updatePlaybackState({ status: PlaybackStatus.PLAYING });
+      return { success: true };
+    }
+    // Paused, but the audio did not survive suspension (e.g. persistence
+    // failed): replay the current paragraph from the start.
+    if (audioContext.tabId) {
+      return requestAndPlayParagraph(playbackState.currentParagraphIndex);
+    }
   }
   
   // Get API key and voice
@@ -344,7 +423,14 @@ async function handlePlay(payload) {
   if (!text || text.trim().length === 0) {
     return { success: false, error: 'No text to play' };
   }
-  
+
+  const generation = ++playbackGeneration;
+
+  // Cancel any TTS request from a previous play that is still in flight
+  playAbortController?.abort();
+  playAbortController = new AbortController();
+  const signal = playAbortController.signal;
+
   // Update state to loading
   await updatePlaybackState({
     status: PlaybackStatus.LOADING,
@@ -354,35 +440,41 @@ async function handlePlay(payload) {
     currentTime: 0,
     error: null
   });
-  
+
   audioContext.tabId = tabId;
-  
+
   try {
     // Request TTS from ElevenLabs API
-    const response = await generateSpeech(apiKey, text, voiceId);
-    
-    audioContext.audioData = response.audio;
+    const response = await textToSpeech(apiKey, text, voiceId, { signal });
+
+    // A newer play or stop request took over while audio was generating
+    if (generation !== playbackGeneration) {
+      return { success: false, error: 'Superseded by a newer request' };
+    }
+
+    audioContext.audioData = response.audioBase64;
     audioContext.alignmentData = response.alignment;
-    
+    await persistAudioContext();
+
     // Ensure offscreen document exists and play audio
     await ensureOffscreenDocument();
-    
-    // Convert ArrayBuffer to base64 for messaging (ArrayBuffer can't be sent directly)
-    const audioBase64 = arrayBufferToBase64(response.audio);
-    
+
     await sendToOffscreen({
       type: 'play',
-      audioBase64: audioBase64,
+      audioBase64: response.audioBase64,
       speed: playbackState.speed
     });
-    
+
     await updatePlaybackState({ status: PlaybackStatus.PLAYING });
-    
+
     // Initiate preload for the next paragraph (for seamless auto-continue)
     await initiatePreload(paragraphIndex);
-    
+
     return { success: true };
   } catch (error) {
+    if (generation !== playbackGeneration) {
+      return { success: false, error: 'Superseded by a newer request' };
+    }
     await updatePlaybackState({
       status: PlaybackStatus.ERROR,
       error: error.message
@@ -411,15 +503,21 @@ async function handlePause() {
  * @returns {Promise<Object>}
  */
 async function handleStop() {
+  // Invalidate any in-flight play request so its result is discarded
+  playbackGeneration++;
+  playAbortController?.abort();
+  playAbortController = null;
+
   await sendToOffscreen({ type: 'stop' });
-  
+
   // Reset state
   audioContext.audioData = null;
   audioContext.alignmentData = null;
-  
+
   // Clear any preloaded audio since playback is stopping
   clearPreloadState();
-  
+  await persistAudioContext();
+
   await updatePlaybackState({
     status: PlaybackStatus.IDLE,
     currentParagraphIndex: 0,
@@ -538,7 +636,7 @@ async function handleGetVoices() {
   }
   
   try {
-    const voices = await fetchVoices(apiKey);
+    const voices = await getVoices(apiKey);
     return { success: true, voices };
   } catch (error) {
     return { success: false, error: error.message };
@@ -625,7 +723,8 @@ async function handleSetTotalParagraphs(payload) {
   
   // Update playback state (no need to broadcast for this internal state)
   playbackState.totalParagraphs = totalParagraphs;
-  
+  await persistPlaybackState();
+
   return { success: true };
 }
 
@@ -674,102 +773,6 @@ async function handleInitialize() {
   } catch (error) {
     return { success: false, error: 'Content script not loaded on this page' };
   }
-}
-
-/**
- * Generate speech using ElevenLabs API
- * @param {string} apiKey - API key
- * @param {string} text - Text to convert
- * @param {string} voiceId - Voice ID
- * @returns {Promise<{audio: ArrayBuffer, alignment: Object}>}
- */
-async function generateSpeech(apiKey, text, voiceId) {
-  const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/with-timestamps`,
-    {
-      method: 'POST',
-      headers: {
-        'xi-api-key': apiKey,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        text: text,
-        model_id: 'eleven_monolingual_v1',
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75
-        }
-      })
-    }
-  );
-  
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    const errorMessage = errorData.detail?.message || errorData.detail?.status || `API error: ${response.status}`;
-    throw new Error(errorMessage);
-  }
-  
-  const data = await response.json();
-  
-  // Decode base64 audio
-  const binaryString = atob(data.audio_base64);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  
-  return {
-    audio: bytes.buffer,
-    alignment: data.alignment || {
-      characters: [],
-      character_start_times_seconds: [],
-      character_end_times_seconds: []
-    }
-  };
-}
-
-/**
- * Fetch voices from ElevenLabs API
- * @param {string} apiKey - API key
- * @returns {Promise<Array>}
- */
-async function fetchVoices(apiKey) {
-  const response = await fetch('https://api.elevenlabs.io/v1/voices', {
-    method: 'GET',
-    headers: {
-      'xi-api-key': apiKey,
-      'Content-Type': 'application/json'
-    }
-  });
-  
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    const errorMessage = errorData.detail?.message || errorData.detail?.status || `API error: ${response.status}`;
-    throw new Error(errorMessage);
-  }
-  
-  const data = await response.json();
-  return (data.voices || []).map(voice => ({
-    voice_id: voice.voice_id,
-    name: voice.name,
-    category: voice.category || 'unknown',
-    labels: voice.labels || {}
-  }));
-}
-
-
-/**
- * Convert ArrayBuffer to base64 string for messaging
- * @param {ArrayBuffer} buffer - ArrayBuffer to convert
- * @returns {string} Base64 encoded string
- */
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
 }
 
 /**
@@ -833,10 +836,14 @@ async function sendToOffscreen(message) {
 async function requestAndPlayParagraph(paragraphIndex) {
   // Clear preload state since we're manually navigating
   clearPreloadState();
-  
-  // Stop current audio via offscreen
+
+  // Stop current audio via offscreen and drop it, so a suspension during the
+  // upcoming load cannot restore stale audio under the new paragraph index
   await sendToOffscreen({ type: 'stop' });
-  
+  audioContext.audioData = null;
+  audioContext.alignmentData = null;
+  await persistAudioContext();
+
   // Update state to loading
   await updatePlaybackState({
     status: PlaybackStatus.LOADING,
@@ -923,7 +930,8 @@ async function handleAudioEnded() {
   // First, clean up the current audio state
   audioContext.audioData = null;
   audioContext.alignmentData = null;
-  
+  await persistAudioContext();
+
   // Check if auto-continue is enabled and there's a next paragraph
   if (!autoContinue || currentParagraphIndex >= totalParagraphs - 1) {
     // Stop playback - either auto-continue is disabled or we're at the last paragraph
@@ -971,7 +979,8 @@ async function playPreloadedAudio(paragraphIndex) {
   // Move preloaded data to active audio context
   audioContext.audioData = preloadState.audioData;
   audioContext.alignmentData = preloadState.alignmentData;
-  
+  await persistAudioContext();
+
   // Clear preload state
   clearPreloadState();
   
@@ -986,10 +995,9 @@ async function playPreloadedAudio(paragraphIndex) {
   
   // Play the audio
   await ensureOffscreenDocument();
-  const audioBase64 = arrayBufferToBase64(audioContext.audioData);
   await sendToOffscreen({
     type: 'play',
-    audioBase64: audioBase64,
+    audioBase64: audioContext.audioData,
     speed: playbackState.speed
   });
   
@@ -1008,6 +1016,11 @@ async function handleOffscreenMessage(message) {
     case 'timeUpdate':
       // Update current time and broadcast highlight updates
       playbackState.currentTime = message.currentTime;
+      // Persist position at most every ~2s of playback so an unexpected
+      // worker death loses little progress (status changes persist instantly)
+      if (Math.abs(message.currentTime - lastPersistedTime) >= 2) {
+        persistPlaybackState();
+      }
       await broadcastHighlightUpdate(message.currentTime);
       break;
       
@@ -1052,12 +1065,14 @@ async function broadcastHighlightUpdate(currentTime) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Handle messages from offscreen document
   if (message.target === 'service-worker') {
-    handleOffscreenMessage(message);
+    stateReady.then(() => handleOffscreenMessage(message));
     return;
   }
-  
+
   // Handle messages from content scripts and popup
   const handleMessage = async () => {
+    // Never act on default (empty) state before restoration completes
+    await stateReady;
     switch (message.type) {
       case MessageType.PLAY:
         return handlePlay({ ...message.payload, tabId: sender.tab?.id });
@@ -1116,7 +1131,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 /**
  * Handle tab close - stop playback if active tab closes
  */
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await stateReady;
   if (tabId === audioContext.tabId) {
     console.log('ElevenPage Reader: Active tab closed, stopping playback');
     handleStop();
@@ -1126,7 +1142,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 /**
  * Handle tab navigation - stop playback if active tab navigates
  */
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  await stateReady;
   if (tabId === audioContext.tabId && changeInfo.status === 'loading') {
     console.log('ElevenPage Reader: Active tab navigating, stopping playback');
     handleStop();
@@ -1141,39 +1158,42 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   // for future enhancements if needed
 });
 
-// Initialize state on service worker start
-initializeState();
+// Restore state on every service worker start (including wake-ups after
+// suspension); handlers await this before touching state
+const stateReady = restoreState();
 
 // Export for testing
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = {
-    MessageType,
-    PlaybackStatus,
-    SKIP_PREVIOUS_THRESHOLD,
-    getPlaybackState,
-    updatePlaybackState,
-    broadcastStateChange,
-    getCurrentPlaybackState,
-    handlePlay,
-    handlePause,
-    handleStop,
-    handleSetSpeed,
-    handleGetState,
-    handleSetAutoContinue,
-    handleSetTotalParagraphs,
-    handleJumpToParagraph,
-    handleSkipNext,
-    handleSkipPrevious,
-    handleInitialize,
-    requestAndPlayParagraph,
-    handleAudioEnded,
-    requestNextParagraph,
-    // Preload functions
-    clearPreloadState,
-    initiatePreload,
-    preloadAudio,
-    playPreloadedAudio,
-    getPreloadState: () => ({ ...preloadState }),
-    setAudioContextTabId: (tabId) => { audioContext.tabId = tabId; }
-  };
-}
+const getPreloadState = () => ({ ...preloadState });
+const setAudioContextTabId = (tabId) => { audioContext.tabId = tabId; };
+
+export {
+  MessageType,
+  PlaybackStatus,
+  SKIP_PREVIOUS_THRESHOLD,
+  getPlaybackState,
+  updatePlaybackState,
+  broadcastStateChange,
+  getCurrentPlaybackState,
+  handlePlay,
+  handlePause,
+  handleStop,
+  handleSetSpeed,
+  handleGetState,
+  handleSetAutoContinue,
+  handleSetTotalParagraphs,
+  handleJumpToParagraph,
+  handleSkipNext,
+  handleSkipPrevious,
+  handleInitialize,
+  requestAndPlayParagraph,
+  handleAudioEnded,
+  requestNextParagraph,
+  restoreState,
+  // Preload functions
+  clearPreloadState,
+  initiatePreload,
+  preloadAudio,
+  playPreloadedAudio,
+  getPreloadState,
+  setAudioContextTabId
+};

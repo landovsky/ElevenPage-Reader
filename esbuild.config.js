@@ -4,12 +4,14 @@ const isWatch = process.argv.includes('--watch');
 
 const buildOptions = {
   entryPoints: [
-    'src/content/content-entry.js',
+    { in: 'src/content/content-entry.js', out: 'content-entry' },
+    { in: 'src/background/service-worker.js', out: 'service-worker' },
+    { in: 'src/popup/popup.js', out: 'popup' },
   ],
   outdir: 'dist',
   bundle: true,
   format: 'iife',
-  target: ['chrome90'],
+  target: ['chrome116'],
   sourcemap: process.env.NODE_ENV !== 'production',
   minify: process.env.NODE_ENV === 'production',
 };

@@ -3,9 +3,7 @@
 
 import {
   parsePageContent,
-  wrapWordsInSpans,
-  restoreAllContent,
-  PARAGRAPH_INDEX_ATTR
+  restoreAllContent
 } from './text-parser.js';
 
 import { HighlightManager } from './highlight-manager.js';
@@ -123,11 +121,8 @@ async function initialize() {
       payload: { totalParagraphs } 
     });
     
-    for (let i = 0; i < contentState.parsedContent.paragraphs.length; i++) {
-      const paragraph = contentState.parsedContent.paragraphs[i];
-      wrapWordsInSpans(paragraph.element, i, paragraph.sentences);
-    }
-    
+    // Paragraphs are wrapped in word spans lazily by the HighlightManager,
+    // one at a time as they play — the rest of the page DOM stays untouched
     contentState.highlightManager = new HighlightManager();
     contentState.highlightManager.setParsedContent(contentState.parsedContent);
     injectButtons(contentState.parsedContent.paragraphs);

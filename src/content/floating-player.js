@@ -1,36 +1,7 @@
 // ElevenPage Reader - Floating Player
 // Injects and manages the floating control overlay
 
-/**
- * Message types for communication with service worker
- */
-const MessageType = {
-  PLAY: 'play',
-  PAUSE: 'pause',
-  STOP: 'stop',
-  SET_SPEED: 'setSpeed',
-  GET_STATE: 'getState',
-  SET_AUTO_CONTINUE: 'setAutoContinue',
-  PLAYBACK_STATE_CHANGE: 'playbackStateChange',
-  SKIP_NEXT: 'skipNext',
-  SKIP_PREVIOUS: 'skipPrevious',
-  HIGHLIGHT_UPDATE: 'highlightUpdate',
-  SET_TOTAL_PARAGRAPHS: 'setTotalParagraphs',
-  GET_NEXT_PARAGRAPH: 'getNextParagraph',
-  SHOW_PLAYER: 'showPlayer',
-  INITIALIZE: 'initialize'
-};
-
-/**
- * Playback status enum
- */
-const PlaybackStatus = {
-  IDLE: 'idle',
-  LOADING: 'loading',
-  PLAYING: 'playing',
-  PAUSED: 'paused',
-  ERROR: 'error'
-};
+import { MessageType, PlaybackStatus } from '../shared/constants.js';
 
 /**
  * Speed options for the speed control

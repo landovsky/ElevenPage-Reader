@@ -17,6 +17,21 @@ let currentSpeed = 1.0;
 let timeUpdateInterval = null;
 
 /**
+ * Blob URL for the current audio, kept so it can be revoked when replaced
+ */
+let currentObjectUrl = null;
+
+/**
+ * Revoke the current blob URL, if any
+ */
+function revokeObjectUrl() {
+  if (currentObjectUrl) {
+    URL.revokeObjectURL(currentObjectUrl);
+    currentObjectUrl = null;
+  }
+}
+
+/**
  * Convert base64 string to ArrayBuffer
  * @param {string} base64 - Base64 encoded string
  * @returns {ArrayBuffer}
@@ -44,13 +59,14 @@ function createAudioElement(audioData) {
     audioElement.src = '';
     audioElement = null;
   }
-  
+  revokeObjectUrl();
+
   // Create blob URL from audio data
   const blob = new Blob([audioData], { type: 'audio/mpeg' });
-  const url = URL.createObjectURL(blob);
-  
+  currentObjectUrl = URL.createObjectURL(blob);
+
   // Create audio element
-  audioElement = new Audio(url);
+  audioElement = new Audio(currentObjectUrl);
   audioElement.playbackRate = currentSpeed;
   
   // Set up event listeners
@@ -122,14 +138,20 @@ function sendToServiceWorker(message) {
  * Handle play command
  * @param {string} audioBase64 - Base64 encoded audio data
  * @param {number} speed - Playback speed
+ * @param {number} [startTime=0] - Position in seconds to start playback from,
+ *   used when resuming after this document was closed during a pause
  */
-async function handlePlay(audioBase64, speed) {
+async function handlePlay(audioBase64, speed, startTime = 0) {
   currentSpeed = speed;
-  
+
   // Convert base64 back to ArrayBuffer
   const audioData = base64ToArrayBuffer(audioBase64);
   const audio = createAudioElement(audioData);
-  
+
+  if (startTime > 0) {
+    audio.currentTime = startTime;
+  }
+
   try {
     await audio.play();
     startTimeUpdates();
@@ -183,6 +205,7 @@ function handleStop() {
     audioElement.src = '';
     audioElement = null;
   }
+  revokeObjectUrl();
 }
 
 /**
@@ -210,7 +233,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   
   switch (message.type) {
     case 'play':
-      handlePlay(message.audioBase64, message.speed);
+      handlePlay(message.audioBase64, message.speed, message.startTime);
       break;
       
     case 'pause':

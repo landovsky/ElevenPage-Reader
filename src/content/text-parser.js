@@ -59,19 +59,6 @@ const PROCESSED_ATTR = 'data-elevenlabs-processed';
  */
 
 /**
- * Selectors for paragraph-like elements
- */
-const PARAGRAPH_SELECTORS = [
-  'article p',
-  'main p',
-  '.content p',
-  '.post-content p',
-  '.entry-content p',
-  '.article-body p',
-  'p'
-];
-
-/**
  * Elements to exclude from parsing
  */
 const EXCLUDED_SELECTORS = [
@@ -197,46 +184,30 @@ function getTextContent(element) {
  */
 function parsePageContent(doc = document) {
   const paragraphs = [];
-  const seenElements = new Set();
-  
-  // Try each selector in order of specificity
-  for (const selector of PARAGRAPH_SELECTORS) {
-    try {
-      const elements = doc.querySelectorAll(selector);
-      
-      for (const element of elements) {
-        // Skip if already processed or should be excluded
-        if (seenElements.has(element)) {
-          continue;
-        }
-        
-        if (shouldExcludeElement(element)) {
-          continue;
-        }
-        
-        const text = getTextContent(element);
-        
-        // Skip empty paragraphs
-        if (!text) {
-          continue;
-        }
-        
-        seenElements.add(element);
-        
-        const sentences = parseSentences(text);
-        
-        paragraphs.push({
-          element,
-          sentences,
-          originalHTML: element.innerHTML
-        });
-      }
-    } catch (e) {
-      // Invalid selector, skip
-      console.warn('ElevenPage Reader: Invalid selector', selector, e);
+
+  // A single pass keeps paragraph indices in document order, which the
+  // auto-continue and skip features rely on for correct reading order
+  const elements = doc.querySelectorAll('p');
+
+  for (const element of elements) {
+    if (shouldExcludeElement(element)) {
+      continue;
     }
+
+    const text = getTextContent(element);
+
+    // Skip empty paragraphs
+    if (!text) {
+      continue;
+    }
+
+    paragraphs.push({
+      element,
+      sentences: parseSentences(text),
+      originalHTML: element.innerHTML
+    });
   }
-  
+
   return { paragraphs };
 }
 
@@ -389,7 +360,13 @@ function restoreOriginalContent(paragraph) {
   if (!paragraph || !paragraph.element || !paragraph.originalHTML) {
     return;
   }
-  
+
+  // Only touch paragraphs that were actually wrapped — rewriting untouched
+  // ones would needlessly mutate the page (and confuse SPA frameworks)
+  if (!paragraph.element.hasAttribute(PROCESSED_ATTR)) {
+    return;
+  }
+
   paragraph.element.innerHTML = paragraph.originalHTML;
   paragraph.element.removeAttribute(PROCESSED_ATTR);
   paragraph.element.removeAttribute(PARAGRAPH_INDEX_ATTR);

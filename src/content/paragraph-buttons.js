@@ -1,34 +1,35 @@
 // ElevenPage Reader - Paragraph Buttons
-// Injects play buttons next to paragraphs for navigation
+// Shows a single floating play button next to the paragraph under the cursor.
+// The button is one element appended to document.body and repositioned on
+// hover — nothing in the page's own DOM is wrapped, reparented, or rewritten.
+
+import { MessageType } from '../shared/constants.js';
 
 /**
- * CSS class for paragraph buttons
+ * CSS class for the hover play button
  */
 const BUTTON_CLASS = 'elevenlabs-paragraph-button';
 
 /**
- * CSS class for paragraph wrapper
+ * CSS class that makes the hover button visible
  */
-const WRAPPER_CLASS = 'elevenlabs-paragraph-wrapper';
+const BUTTON_VISIBLE_CLASS = 'elevenlabs-paragraph-button-visible';
 
 /**
- * Data attribute for paragraph index
+ * Data attribute for the paragraph index the button currently targets
  */
 const PARAGRAPH_INDEX_ATTR = 'data-paragraph-index';
 
 /**
- * Message types (matching service-worker.js)
+ * Delay before hiding the button after the cursor leaves a paragraph,
+ * long enough to move the cursor onto the button itself
  */
-const MessageType = {
-  STOP: 'stop',
-  JUMP_TO_PARAGRAPH: 'jumpToParagraph'
-};
+const HIDE_DELAY_MS = 300;
 
 /**
- * Store references to injected buttons and wrappers for cleanup
+ * The single floating button element (null when not injected)
  */
-let injectedButtons = [];
-let injectedWrappers = [];
+let hoverButton = null;
 
 /**
  * Reference to paragraphs data for click handlers
@@ -36,25 +37,33 @@ let injectedWrappers = [];
 let paragraphsData = null;
 
 /**
- * Creates a play button element
- * @param {number} paragraphIndex - Index of the paragraph
+ * Maps paragraph elements to their index for fast hover lookup
+ */
+let paragraphIndexMap = null;
+
+/**
+ * Pending hide timer ID
+ */
+let hideTimer = null;
+
+/**
+ * Creates the floating play button element
  * @returns {HTMLButtonElement} The button element
  */
-function createButton(paragraphIndex) {
+function createButton() {
   const button = document.createElement('button');
   button.className = BUTTON_CLASS;
-  button.setAttribute(PARAGRAPH_INDEX_ATTR, String(paragraphIndex));
   button.setAttribute('type', 'button');
-  button.setAttribute('aria-label', `Play paragraph ${paragraphIndex + 1}`);
+  button.setAttribute('aria-label', 'Play paragraph');
   button.setAttribute('title', 'Play from here');
-  
+
   // Play icon (SVG)
   button.innerHTML = `
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
       <path d="M8 5v14l11-7z"/>
     </svg>
   `;
-  
+
   return button;
 }
 
@@ -65,25 +74,25 @@ function createButton(paragraphIndex) {
 async function handleButtonClick(event) {
   event.preventDefault();
   event.stopPropagation();
-  
+
   const button = event.currentTarget;
   const paragraphIndex = parseInt(button.getAttribute(PARAGRAPH_INDEX_ATTR), 10);
-  
+
   if (isNaN(paragraphIndex) || !paragraphsData || !paragraphsData[paragraphIndex]) {
     console.error('ElevenPage Reader: Invalid paragraph index');
     return;
   }
-  
+
   const paragraph = paragraphsData[paragraphIndex];
-  
+
   // Get the text content of the paragraph
   const text = paragraph.sentences.map(s => s.text).join(' ');
-  
+
   if (!text || text.trim().length === 0) {
     console.error('ElevenPage Reader: No text content in paragraph');
     return;
   }
-  
+
   try {
     // Send message to service worker to jump to this paragraph
     const response = await chrome.runtime.sendMessage({
@@ -93,7 +102,7 @@ async function handleButtonClick(event) {
         text
       }
     });
-    
+
     if (!response.success) {
       console.error('ElevenPage Reader: Failed to start playback:', response.error);
     }
@@ -103,89 +112,158 @@ async function handleButtonClick(event) {
 }
 
 /**
- * Injects play buttons next to each paragraph
+ * Positions the button to the left of a paragraph, vertically centered on
+ * its first line area
+ * @param {HTMLElement} element - Paragraph element being hovered
+ */
+function positionButton(element) {
+  const win = element.ownerDocument.defaultView;
+  const rect = element.getBoundingClientRect();
+  const scrollX = win ? win.scrollX || 0 : 0;
+  const scrollY = win ? win.scrollY || 0 : 0;
+
+  hoverButton.style.left = `${Math.max(rect.left + scrollX - 32, 4)}px`;
+  hoverButton.style.top = `${rect.top + scrollY + Math.min(rect.height / 2, 12) - 12}px`;
+}
+
+/**
+ * Shows the button next to a paragraph and points it at that index
+ * @param {HTMLElement} element - Paragraph element
+ * @param {number} index - Paragraph index
+ */
+function showButtonFor(element, index) {
+  if (!hoverButton) return;
+
+  if (hideTimer) {
+    clearTimeout(hideTimer);
+    hideTimer = null;
+  }
+
+  hoverButton.setAttribute(PARAGRAPH_INDEX_ATTR, String(index));
+  hoverButton.setAttribute('aria-label', `Play paragraph ${index + 1}`);
+  positionButton(element);
+  hoverButton.classList.add(BUTTON_VISIBLE_CLASS);
+}
+
+/**
+ * Hides the button after a short delay (cancelled if the cursor reaches the
+ * button or another paragraph first)
+ */
+function scheduleHide() {
+  if (hideTimer) {
+    clearTimeout(hideTimer);
+  }
+  hideTimer = setTimeout(() => {
+    hideTimer = null;
+    hideButtonNow();
+  }, HIDE_DELAY_MS);
+}
+
+/**
+ * Hides the button immediately
+ */
+function hideButtonNow() {
+  if (hoverButton) {
+    hoverButton.classList.remove(BUTTON_VISIBLE_CLASS);
+  }
+}
+
+/**
+ * Delegated hover handler - shows the button when the cursor is over a
+ * parsed paragraph, hides it otherwise
+ * @param {Event} event - mouseover event
+ */
+function handleMouseOver(event) {
+  if (!hoverButton || !paragraphIndexMap) return;
+
+  // Moving onto the button itself keeps it visible
+  if (event.target === hoverButton || hoverButton.contains(event.target)) {
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+    return;
+  }
+
+  // Walk up from the hovered node to find a parsed paragraph
+  let el = event.target;
+  while (el && el.nodeType === 1) {
+    if (paragraphIndexMap.has(el)) {
+      showButtonFor(el, paragraphIndexMap.get(el));
+      return;
+    }
+    el = el.parentElement;
+  }
+
+  scheduleHide();
+}
+
+/**
+ * Sets up the hover play button for the parsed paragraphs
  * @param {Array} paragraphs - Array of paragraph objects from text parser
- * @returns {HTMLButtonElement[]} Array of injected button elements
+ * @returns {HTMLButtonElement[]} The injected button (single-element array)
  */
 function injectButtons(paragraphs) {
   if (!paragraphs || !Array.isArray(paragraphs)) {
     return [];
   }
-  
-  // Clean up any existing buttons first
+
+  // Clean up any existing button first
   removeButtons();
-  
-  // Store reference for click handlers (after removeButtons to avoid being cleared)
-  paragraphsData = paragraphs;
-  
-  const buttons = [];
-  
-  for (let i = 0; i < paragraphs.length; i++) {
-    const paragraph = paragraphs[i];
-    
-    if (!paragraph || !paragraph.element) {
-      continue;
-    }
-    
-    const element = paragraph.element;
-    
-    // Create wrapper to position button relative to paragraph
-    const wrapper = document.createElement('div');
-    wrapper.className = WRAPPER_CLASS;
-    wrapper.setAttribute(PARAGRAPH_INDEX_ATTR, String(i));
-    
-    // Insert wrapper before the paragraph
-    element.parentNode.insertBefore(wrapper, element);
-    
-    // Move paragraph into wrapper
-    wrapper.appendChild(element);
-    
-    // Create and add button
-    const button = createButton(i);
-    button.addEventListener('click', handleButtonClick);
-    
-    // Insert button at the beginning of wrapper (before paragraph)
-    wrapper.insertBefore(button, element);
-    
-    buttons.push(button);
-    injectedButtons.push(button);
-    injectedWrappers.push(wrapper);
+
+  if (paragraphs.length === 0) {
+    return [];
   }
-  
-  return buttons;
+
+  paragraphsData = paragraphs;
+  paragraphIndexMap = new WeakMap();
+  paragraphs.forEach((paragraph, index) => {
+    if (paragraph && paragraph.element) {
+      paragraphIndexMap.set(paragraph.element, index);
+    }
+  });
+
+  hoverButton = createButton();
+  hoverButton.addEventListener('click', handleButtonClick);
+  document.body.appendChild(hoverButton);
+
+  document.addEventListener('mouseover', handleMouseOver);
+  // Positions go stale as soon as the page scrolls; hide until next hover
+  document.addEventListener('scroll', hideButtonNow, true);
+
+  return [hoverButton];
 }
 
 /**
- * Removes all injected buttons and restores original DOM structure
+ * Removes the hover button and its listeners
  */
 function removeButtons() {
-  // Remove event listeners and buttons
-  for (const button of injectedButtons) {
-    button.removeEventListener('click', handleButtonClick);
-    button.remove();
+  if (hideTimer) {
+    clearTimeout(hideTimer);
+    hideTimer = null;
   }
-  
-  // Unwrap paragraphs from wrappers
-  for (const wrapper of injectedWrappers) {
-    const paragraph = wrapper.querySelector('p, [data-elevenlabs-processed]');
-    if (paragraph && wrapper.parentNode) {
-      wrapper.parentNode.insertBefore(paragraph, wrapper);
-      wrapper.remove();
-    }
+
+  if (hoverButton) {
+    hoverButton.removeEventListener('click', handleButtonClick);
+    hoverButton.remove();
+    hoverButton = null;
   }
-  
-  // Clear references
-  injectedButtons = [];
-  injectedWrappers = [];
+
+  if (typeof document !== 'undefined') {
+    document.removeEventListener('mouseover', handleMouseOver);
+    document.removeEventListener('scroll', hideButtonNow, true);
+  }
+
   paragraphsData = null;
+  paragraphIndexMap = null;
 }
 
 /**
- * Gets the number of currently injected buttons
+ * Gets the number of currently injected buttons (0 or 1)
  * @returns {number} Number of buttons
  */
 function getButtonCount() {
-  return injectedButtons.length;
+  return hoverButton ? 1 : 0;
 }
 
 /**
@@ -193,7 +271,7 @@ function getButtonCount() {
  * @returns {HTMLButtonElement[]} Array of button elements
  */
 function getButtons() {
-  return [...injectedButtons];
+  return hoverButton ? [hoverButton] : [];
 }
 
 // Export for use in other modules
@@ -203,6 +281,6 @@ export {
   getButtonCount,
   getButtons,
   BUTTON_CLASS,
-  WRAPPER_CLASS,
+  BUTTON_VISIBLE_CLASS,
   PARAGRAPH_INDEX_ATTR
 };

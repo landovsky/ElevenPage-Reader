@@ -9,6 +9,7 @@ import * as fc from 'fast-check';
 
 // Mock Chrome APIs
 const mockStorage = new Map();
+const mockSessionStorage = new Map();
 let broadcastedMessages = [];
 let tabMessages = [];
 
@@ -30,6 +31,25 @@ const chromeMock = {
           }
         });
         callback?.(result);
+      })
+    },
+    // Promise-based session storage, as used by the service worker for
+    // suspension-safe state persistence
+    session: {
+      set: vi.fn(async (items) => {
+        Object.entries(items).forEach(([key, value]) => {
+          mockSessionStorage.set(key, JSON.parse(JSON.stringify(value ?? null)));
+        });
+      }),
+      get: vi.fn(async (keys) => {
+        const result = {};
+        const keyList = keys === null ? Array.from(mockSessionStorage.keys()) : (Array.isArray(keys) ? keys : [keys]);
+        keyList.forEach(key => {
+          if (mockSessionStorage.has(key)) {
+            result[key] = mockSessionStorage.get(key);
+          }
+        });
+        return result;
       })
     }
   },
@@ -2243,5 +2263,112 @@ describe('Paragraph Skip Controls - Unit Tests for Edge Cases', () => {
       const state = serviceWorkerModule.getPlaybackState();
       expect(state.currentParagraphIndex).toBe(0);
     });
+  });
+});
+
+/**
+ * Suspension recovery
+ *
+ * MV3 suspends idle service workers after ~30s, wiping module-level state.
+ * The worker persists playback state and audio context to
+ * chrome.storage.session and restores them on startup via restoreState().
+ */
+describe('Service Worker Suspension Recovery', () => {
+  beforeEach(() => {
+    mockStorage.clear();
+    mockSessionStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  it('should restore persisted paused state on startup', async () => {
+    mockSessionStorage.set('sessionPlaybackState', {
+      status: 'paused',
+      currentParagraphIndex: 3,
+      currentSentenceIndex: 0,
+      currentWordIndex: 0,
+      currentTime: 12.5,
+      speed: 1.5,
+      error: null,
+      autoContinue: true,
+      totalParagraphs: 10
+    });
+    mockSessionStorage.set('sessionAudioContext', {
+      audioData: 'QkFTRTY0QVVESU8=',
+      alignmentData: { characters: [] },
+      tabId: 42
+    });
+
+    await serviceWorkerModule.restoreState();
+
+    const state = serviceWorkerModule.getPlaybackState();
+    expect(state.status).toBe('paused');
+    expect(state.currentParagraphIndex).toBe(3);
+    expect(state.currentTime).toBe(12.5);
+    expect(state.speed).toBe(1.5);
+    expect(state.totalParagraphs).toBe(10);
+  });
+
+  it('should downgrade a stale PLAYING status to PAUSED when audio survived', async () => {
+    mockSessionStorage.set('sessionPlaybackState', {
+      status: 'playing',
+      currentParagraphIndex: 1,
+      currentSentenceIndex: 0,
+      currentWordIndex: 0,
+      currentTime: 4,
+      speed: 1.0,
+      error: null,
+      autoContinue: true,
+      totalParagraphs: 5
+    });
+    mockSessionStorage.set('sessionAudioContext', {
+      audioData: 'QkFTRTY0QVVESU8=',
+      alignmentData: { characters: [] },
+      tabId: 7
+    });
+
+    await serviceWorkerModule.restoreState();
+
+    const state = serviceWorkerModule.getPlaybackState();
+    expect(state.status).toBe('paused');
+    // The downgraded status is re-persisted for the next wake-up
+    expect(mockSessionStorage.get('sessionPlaybackState').status).toBe('paused');
+  });
+
+  it('should downgrade a stale LOADING status to IDLE when audio was lost', async () => {
+    mockSessionStorage.set('sessionPlaybackState', {
+      status: 'loading',
+      currentParagraphIndex: 2,
+      currentSentenceIndex: 0,
+      currentWordIndex: 0,
+      currentTime: 0,
+      speed: 1.0,
+      error: null,
+      autoContinue: true,
+      totalParagraphs: 5
+    });
+    mockSessionStorage.set('sessionAudioContext', {
+      audioData: null,
+      alignmentData: null,
+      tabId: 7
+    });
+
+    await serviceWorkerModule.restoreState();
+
+    const state = serviceWorkerModule.getPlaybackState();
+    expect(state.status).toBe('idle');
+  });
+
+  it('should persist state changes to session storage', async () => {
+    await serviceWorkerModule.updatePlaybackState({
+      status: 'paused',
+      currentParagraphIndex: 4,
+      currentTime: 8.25
+    });
+
+    const persisted = mockSessionStorage.get('sessionPlaybackState');
+    expect(persisted).toBeDefined();
+    expect(persisted.status).toBe('paused');
+    expect(persisted.currentParagraphIndex).toBe(4);
+    expect(persisted.currentTime).toBe(8.25);
   });
 });

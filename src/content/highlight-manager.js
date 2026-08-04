@@ -5,7 +5,10 @@ import {
   WORD_SPAN_CLASS,
   WORD_INDEX_ATTR,
   SENTENCE_INDEX_ATTR,
-  PARAGRAPH_INDEX_ATTR
+  PARAGRAPH_INDEX_ATTR,
+  PROCESSED_ATTR,
+  wrapWordsInSpans,
+  restoreOriginalContent
 } from './text-parser.js';
 
 /**
@@ -41,6 +44,14 @@ class HighlightManager {
     
     /** @type {number} */
     this.currentWordIndex = -1;
+
+    /**
+     * Paragraph this manager has lazily wrapped in word spans, or -1.
+     * Only the paragraph being read is ever wrapped, so the rest of the
+     * page's DOM stays untouched.
+     * @type {number}
+     */
+    this.wrappedParagraphIndex = -1;
   }
 
   /**
@@ -57,6 +68,8 @@ class HighlightManager {
    * @param {number} sentenceIndex - Index of the sentence within the paragraph
    */
   highlightSentence(paragraphIndex, sentenceIndex) {
+    this._ensureParagraphWrapped(paragraphIndex);
+
     // Remove previous sentence highlight
     if (this.currentSentenceElement) {
       this.currentSentenceElement.classList.remove(SENTENCE_HIGHLIGHT_CLASS);
@@ -83,6 +96,8 @@ class HighlightManager {
    * @param {number} wordIndex - Index of the word within the sentence
    */
   highlightWord(paragraphIndex, sentenceIndex, wordIndex) {
+    this._ensureParagraphWrapped(paragraphIndex);
+
     // Remove previous word highlight
     if (this.currentWordElement) {
       this.currentWordElement.classList.remove(WORD_HIGHLIGHT_CLASS);
@@ -105,9 +120,47 @@ class HighlightManager {
   }
 
   /**
-   * Clears all highlights from the page
+   * Lazily wraps a paragraph in word spans just before it is highlighted,
+   * restoring the previously wrapped paragraph so at most one paragraph's
+   * DOM is modified at any time.
+   * @param {number} paragraphIndex - Paragraph about to be highlighted
+   * @private
+   */
+  _ensureParagraphWrapped(paragraphIndex) {
+    if (!this.parsedContent) return;
+
+    const paragraph = this.parsedContent.paragraphs[paragraphIndex];
+    if (!paragraph || !paragraph.element) return;
+
+    // Already wrapped (either by us or by the caller upfront)
+    if (paragraph.element.hasAttribute(PROCESSED_ATTR)) return;
+
+    if (this.wrappedParagraphIndex >= 0 &&
+        this.wrappedParagraphIndex !== paragraphIndex) {
+      const previous = this.parsedContent.paragraphs[this.wrappedParagraphIndex];
+      if (previous) {
+        restoreOriginalContent(previous);
+      }
+    }
+
+    wrapWordsInSpans(paragraph.element, paragraphIndex, paragraph.sentences);
+    this.wrappedParagraphIndex = paragraphIndex;
+  }
+
+  /**
+   * Clears all highlights from the page and restores any paragraph this
+   * manager wrapped, returning the page DOM to its original state
    */
   clearHighlights() {
+    // Restore the lazily wrapped paragraph before clearing element refs
+    if (this.wrappedParagraphIndex >= 0 && this.parsedContent) {
+      const wrapped = this.parsedContent.paragraphs[this.wrappedParagraphIndex];
+      if (wrapped) {
+        restoreOriginalContent(wrapped);
+      }
+      this.wrappedParagraphIndex = -1;
+    }
+
     // Remove sentence highlight
     if (this.currentSentenceElement) {
       this.currentSentenceElement.classList.remove(SENTENCE_HIGHLIGHT_CLASS);
