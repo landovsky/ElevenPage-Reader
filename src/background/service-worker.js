@@ -508,7 +508,7 @@ async function handleStop() {
   playAbortController?.abort();
   playAbortController = null;
 
-  await sendToOffscreen({ type: 'stop' });
+  await stopOffscreenAudio();
 
   // Reset state
   audioContext.audioData = null;
@@ -828,6 +828,17 @@ async function sendToOffscreen(message) {
 }
 
 /**
+ * Stop audio in the offscreen document if one exists. Skipping the message
+ * when there is no document avoids "receiving end does not exist" errors on
+ * every stop that happens before audio has ever played.
+ */
+async function stopOffscreenAudio() {
+  if (await hasOffscreenDocument()) {
+    await sendToOffscreen({ type: 'stop' });
+  }
+}
+
+/**
  * Request paragraph text from content script and initiate playback
  * Used for skip next/previous navigation
  * @param {number} paragraphIndex - Index of paragraph to play
@@ -839,7 +850,7 @@ async function requestAndPlayParagraph(paragraphIndex) {
 
   // Stop current audio via offscreen and drop it, so a suspension during the
   // upcoming load cannot restore stale audio under the new paragraph index
-  await sendToOffscreen({ type: 'stop' });
+  await stopOffscreenAudio();
   audioContext.audioData = null;
   audioContext.alignmentData = null;
   await persistAudioContext();
